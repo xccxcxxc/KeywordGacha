@@ -140,11 +140,18 @@ class NERAnalyzer(Base):
                 })
                 return None
 
-            self.save_ouput(glossary, end = False)
-            self.emit(Base.Event.TOAST, {
-                "type": Base.ToastType.SUCCESS,
-                "message": Localizer.get().engine_task_save_done.replace("{PATH}", Config().load().output_folder),
-            })
+            try:
+                self.save_ouput(glossary, end = False)
+                self.emit(Base.Event.TOAST, {
+                    "type": Base.ToastType.SUCCESS,
+                    "message": Localizer.get().engine_task_save_done.replace("{PATH}", Config().load().output_folder),
+                })
+            except Exception as e:
+                self.error("[Export] Failed to save output", e)
+                self.emit(Base.Event.TOAST, {
+                    "type": Base.ToastType.WARNING,
+                    "message": str(e),
+                })
         threading.Thread(target = task, args = (event, data)).start()
 
     # 请求停止事件
@@ -206,11 +213,9 @@ class NERAnalyzer(Base):
         # 关闭可能已打开的数据库连接（启动时自动恢复的）
         self.cache_manager.close_database()
 
-        # 打开数据库
-        self.cache_manager.open_database(self.config.output_folder)
-
         # 生成缓存列表
         if status == Base.ProjectStatus.PROCESSING:
+            self.cache_manager.open_database(self.config.output_folder)
             self.cache_manager.load_from_database(self.config.output_folder)
         else:
             shutil.rmtree(f"{self.config.output_folder}/cache", ignore_errors = True)
@@ -266,7 +271,7 @@ class NERAnalyzer(Base):
         self.cache_manager.get_project().set_extras(self.extras)
         if status == Base.ProjectStatus.NONE:
             self.cache_manager.get_project().set_status(Base.ProjectStatus.PROCESSING)
-            self.cache_manager.save_to_database()
+            self.cache_manager.save_project_to_database()
 
         # 更新翻译进度
         self.emit(Base.Event.NER_ANALYZER_UPDATE, self.extras)
@@ -339,16 +344,23 @@ class NERAnalyzer(Base):
                     return None
 
                 # 等待所有任务完成，同时响应停止信号
-                executor.shutdown(wait = False)
-                while not all(f.done() for f in futures):
+                while True:
                     if Engine.get().get_status() == Base.TaskStatus.STOPPING:
                         for f in futures:
                             f.cancel()
+                        executor.shutdown(wait = False)
                         return None
-                    time.sleep(0.25)
+                    _, not_done = concurrent.futures.wait(futures, timeout = 0.25)
+                    if not not_done:
+                        break
+
+                # 等待线程池完全关闭（确保所有回调执行完毕）
+                executor.shutdown(wait = True)
 
             # 判断是否需要继续翻译
-            if self.cache_manager.get_item_count_by_status(Base.ProjectStatus.NONE) == 0:
+            none_count = self.cache_manager.get_item_count_by_status(Base.ProjectStatus.NONE)
+            self.info(f"[Round {current_round + 1}] done, remaining NONE items = {none_count}, line = {self.extras.get('line', 0)}/{self.extras.get('total_line', 0)}")
+            if none_count == 0:
                 self.cache_manager.get_project().set_status(Base.ProjectStatus.PROCESSED)
 
                 # 日志
@@ -376,9 +388,6 @@ class NERAnalyzer(Base):
                     "message": Localizer.get().engine_task_fail,
                 })
                 break
-
-        # 等待回调执行完毕
-        time.sleep(1.0)
 
         # 保存最终数据到数据库
         self.cache_manager.save_to_database()
@@ -627,10 +636,12 @@ class NERAnalyzer(Base):
             # 记录数据
             with self.lock:
                 new = {}
-                new["glossary"] = self.extras.get("glossary", []) + result.get("glossary", 0)
+                new["glossary"] = self.extras.get("glossary", []) + result.get("glossary", [])
                 new["start_time"] = self.extras.get("start_time", 0)
                 new["total_line"] = self.extras.get("total_line", 0)
                 new["line"] = self.extras.get("line", 0) + result.get("row_count", 0)
+                if new["line"] > new["total_line"]:
+                    self.warning(f"[Callback] line({new['line']}) > total_line({new['total_line']}), row_count={result.get('row_count', 0)}")
                 new["total_tokens"] = self.extras.get("total_tokens", 0) + result.get("input_tokens", 0) + result.get("output_tokens", 0)
                 new["total_input_tokens"] = self.extras.get("total_input_tokens", 0) + result.get("input_tokens", 0)
                 new["total_output_tokens"] = self.extras.get("total_output_tokens", 0) + result.get("output_tokens", 0)
